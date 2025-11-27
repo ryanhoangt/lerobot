@@ -30,11 +30,20 @@ class DatasetConfig:
     # Root directory where the dataset will be stored (e.g. 'dataset/path').
     root: str | None = None
     episodes: list[int] | None = None
+    split: str | None = None
     image_transforms: ImageTransformsConfig = field(default_factory=ImageTransformsConfig)
     revision: str | None = None
     use_imagenet_stats: bool = True
     video_backend: str = field(default_factory=get_safe_default_codec)
     streaming: bool = False
+
+
+@dataclass
+class OfflineEvalDatasetConfig:
+    split: str | None = None
+    episodes: list[int] | None = None
+    batch_size: int | None = None
+    max_batches: int | None = None
 
 
 @dataclass
