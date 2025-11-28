@@ -15,19 +15,38 @@
 # limitations under the License.
 
 import logging
+import os
+import sys
 import time
+from queue import Empty, Queue
 
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.feetech import (
     FeetechMotorsBus,
     OperatingMode,
 )
+from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
 from ..teleoperator import Teleoperator
 from .config_so101_leader import SO101LeaderConfig
 
 logger = logging.getLogger(__name__)
+
+
+PYNPUT_AVAILABLE = True
+try:
+    if ("DISPLAY" not in os.environ) and ("linux" in sys.platform):
+        logger.info("No DISPLAY set. Skipping pynput import.")
+        raise ImportError("pynput blocked intentionally due to no display.")
+    from pynput import keyboard
+except ImportError:
+    keyboard = None
+    PYNPUT_AVAILABLE = False
+except Exception as e:  # pragma: no cover - defensive
+    keyboard = None
+    PYNPUT_AVAILABLE = False
+    logger.info(f"Could not import pynput: {e}")
 
 
 class SO101Leader(Teleoperator):
@@ -55,6 +74,12 @@ class SO101Leader(Teleoperator):
             calibration=self.calibration,
         )
 
+        self._keyboard_listener = None
+        self._keyboard_events: Queue[str] = Queue()
+        self._pressed_keys: set[object] = set()
+        self._intervention_active = False
+        self._keyboard_warning_logged = False
+
     @property
     def action_features(self) -> dict[str, type]:
         return {f"{motor}.pos": float for motor in self.bus.motors}
@@ -79,6 +104,7 @@ class SO101Leader(Teleoperator):
             self.calibrate()
 
         self.configure()
+        self._start_keyboard_listener()
         logger.info(f"{self} connected.")
 
     @property
@@ -124,6 +150,110 @@ class SO101Leader(Teleoperator):
         self._save_calibration()
         print(f"Calibration saved to {self.calibration_fpath}")
 
+    def get_teleop_events(self) -> dict[TeleopEvents, bool]:
+        """Return teleoperation event flags collected from the keyboard."""
+        events = {
+            TeleopEvents.IS_INTERVENTION: self._intervention_active,
+            TeleopEvents.TERMINATE_EPISODE: False,
+            TeleopEvents.SUCCESS: False,
+            TeleopEvents.RERECORD_EPISODE: False,
+        }
+
+        if not PYNPUT_AVAILABLE or self._keyboard_listener is None:
+            return events
+
+        terminate_episode = False
+        success = False
+        rerecord_episode = False
+
+        while True:
+            try:
+                event = self._keyboard_events.get_nowait()
+            except Empty:
+                break
+
+            if event == "toggle_intervention":
+                self._intervention_active = not self._intervention_active
+            elif event == "success":
+                success = True
+                terminate_episode = True
+            elif event == "failure":
+                success = False
+                terminate_episode = True
+            elif event == "rerecord":
+                success = False
+                rerecord_episode = True
+                terminate_episode = True
+
+        events[TeleopEvents.IS_INTERVENTION] = self._intervention_active
+        events[TeleopEvents.SUCCESS] = success
+        events[TeleopEvents.RERECORD_EPISODE] = rerecord_episode
+        events[TeleopEvents.TERMINATE_EPISODE] = terminate_episode or success or rerecord_episode
+        return events
+
+    def _start_keyboard_listener(self) -> None:
+        """Initialize keyboard listener used to capture teleop events."""
+        if not PYNPUT_AVAILABLE or keyboard is None:
+            if not self._keyboard_warning_logged:
+                logger.info("pynput not available - teleop events will be disabled.")
+                self._keyboard_warning_logged = True
+            return
+
+        if self._keyboard_listener is not None and self._keyboard_listener.is_alive():
+            return
+
+        try:
+            self._keyboard_listener = keyboard.Listener(
+                on_press=self._on_key_press,
+                on_release=self._on_key_release,
+            )
+            self._keyboard_listener.start()
+        except Exception as exc:  # pragma: no cover - defensive
+            if not self._keyboard_warning_logged:
+                logger.error(f"Failed to start keyboard listener: {exc}")
+                self._keyboard_warning_logged = True
+            self._keyboard_listener = None
+            return
+
+        logger.info("Keyboard listener started for teleop event annotations.")
+        logger.info("Keyboard controls - space: toggle intervention, s: success, esc: failure, r: rerecord.")
+
+    def _stop_keyboard_listener(self) -> None:
+        if self._keyboard_listener is not None:
+            self._keyboard_listener.stop()
+            self._keyboard_listener = None
+
+        self._pressed_keys.clear()
+        while True:
+            try:
+                self._keyboard_events.get_nowait()
+            except Empty:
+                break
+        self._intervention_active = False
+
+    def _on_key_press(self, key) -> None:
+        if key in self._pressed_keys:
+            return
+        self._pressed_keys.add(key)
+
+        try:
+            if key == keyboard.Key.space:
+                self._keyboard_events.put("toggle_intervention")
+            elif key == keyboard.Key.esc:
+                self._keyboard_events.put("failure")
+            elif hasattr(key, "char") and key.char is not None:
+                char = key.char.lower()
+                if char == "s":
+                    self._keyboard_events.put("success")
+                elif char == "r":
+                    self._keyboard_events.put("rerecord")
+        except AttributeError:
+            pass
+
+    def _on_key_release(self, key) -> None:
+        self._pressed_keys.discard(key)
+
+
     def configure(self) -> None:
         self.bus.disable_torque()
         self.bus.configure_motors()
@@ -152,5 +282,6 @@ class SO101Leader(Teleoperator):
         if not self.is_connected:
             DeviceNotConnectedError(f"{self} is not connected.")
 
+        self._stop_keyboard_listener()
         self.bus.disconnect()
         logger.info(f"{self} disconnected.")

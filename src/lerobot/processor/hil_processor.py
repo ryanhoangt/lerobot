@@ -439,19 +439,24 @@ class InterventionActionProcessorStep(ProcessorStep):
         if is_intervention and teleop_action is not None:
             if isinstance(teleop_action, dict):
                 # Convert teleop_action dict to tensor format
-                action_list = [
-                    teleop_action.get("delta_x", 0.0),
-                    teleop_action.get("delta_y", 0.0),
-                    teleop_action.get("delta_z", 0.0),
-                ]
-                if self.use_gripper:
-                    action_list.append(teleop_action.get(GRIPPER_KEY, 1.0))
+                if any(key.startswith("delta_") for key in teleop_action) or "delta_x" in teleop_action:
+                    action_list = [
+                        teleop_action.get("delta_x", 0.0),
+                        teleop_action.get("delta_y", 0.0),
+                        teleop_action.get("delta_z", 0.0),
+                    ]
+                    if self.use_gripper:
+                        action_list.append(teleop_action.get(GRIPPER_KEY, 1.0))
+                elif all(isinstance(key, str) and key.endswith(".pos") for key in teleop_action):
+                    action_list = [float(np.asarray(teleop_action[key])) for key in teleop_action]
+                else:
+                    action_list = [float(np.asarray(value)) for value in teleop_action.values()]
             elif isinstance(teleop_action, np.ndarray):
                 action_list = teleop_action.tolist()
             else:
                 action_list = teleop_action
 
-            teleop_action_tensor = torch.tensor(action_list, dtype=action.dtype, device=action.device)
+            teleop_action_tensor = torch.as_tensor(action_list, dtype=action.dtype, device=action.device)
             new_transition[TransitionKey.ACTION] = teleop_action_tensor
 
         # Handle episode termination

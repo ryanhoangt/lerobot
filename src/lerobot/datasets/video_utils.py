@@ -325,6 +325,19 @@ def encode_video_frames(
         return
 
     video_path.parent.mkdir(parents=True, exist_ok=True)
+    previous_av_level = None
+    if log_level is not None:
+        if hasattr(av.logging, "get_level"):
+            try:
+                previous_av_level = av.logging.get_level()
+            except AttributeError:
+                previous_av_level = None
+        if hasattr(av.logging, "set_level"):
+            try:
+                av.logging.set_level(log_level)
+            except AttributeError:
+                pass
+
 
     # Encoders/pixel formats incompatibility check
     if (vcodec == "libsvtav1" or vcodec == "hevc") and pix_fmt == "yuv444p":
@@ -387,6 +400,11 @@ def encode_video_frames(
 
     # Reset logging level
     if log_level is not None:
+        if previous_av_level is not None and hasattr(av.logging, "set_level"):
+            try:
+                av.logging.set_level(previous_av_level)
+            except AttributeError:
+                pass
         av.logging.restore_default_callback()
 
     if not video_path.exists():

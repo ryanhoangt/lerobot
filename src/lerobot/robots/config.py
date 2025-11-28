@@ -25,6 +25,9 @@ class RobotConfig(draccus.ChoiceRegistry, abc.ABC):
     id: str | None = None
     # Directory to store calibration file
     calibration_dir: Path | None = None
+    # Optional kinematics configuration for utilities requiring URDF access
+    urdf_path: str | None = None
+    target_frame_name: str | None = None
 
     def __post_init__(self):
         if hasattr(self, "cameras") and self.cameras:
