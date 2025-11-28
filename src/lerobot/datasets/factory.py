@@ -35,24 +35,44 @@ IMAGENET_STATS = {
 }
 
 
+def resolve_split_episodes(meta: LeRobotDatasetMetadata, split_name: str) -> list[int]:
+    """Return the episode indices corresponding to a split name."""
+
+    splits = meta.info.get("splits")
+    if not splits:
+        raise ValueError("Dataset metadata does not define any splits.")
+
+    if split_name not in splits:
+        raise ValueError(f"Split '{split_name}' not found. Available splits: {list(splits)}")
+
+    spec = splits[split_name]
+    if isinstance(spec, str):
+        try:
+            start_str, end_str = spec.split(":", maxsplit=1)
+            start, end = int(start_str), int(end_str)
+        except ValueError as exc:  # pragma: no cover - defensive branch
+            raise ValueError(f"Split '{split_name}' has invalid range format: {spec!r}") from exc
+        if start < 0 or end < 0 or end < start:
+            raise ValueError(f"Split '{split_name}' has invalid bounds: {spec!r}")
+        return list(range(start, end))
+
+    if isinstance(spec, list):
+        if not spec:
+            raise ValueError(f"Split '{split_name}' has no episodes.")
+        try:
+            return [int(idx) for idx in spec]
+        except ValueError as exc:  # pragma: no cover - defensive branch
+            raise ValueError(f"Split '{split_name}' contains non-integer values: {spec!r}") from exc
+
+    raise ValueError(f"Unsupported split description for '{split_name}': {spec!r}")
+
+
+
 def resolve_delta_timestamps(
     cfg: PreTrainedConfig, ds_meta: LeRobotDatasetMetadata
 ) -> dict[str, list] | None:
-    """Resolves delta_timestamps by reading from the 'delta_indices' properties of the PreTrainedConfig.
+    """Resolves delta_timestamps by reading from the 'delta_indices' properties of the PreTrainedConfig."""
 
-    Args:
-        cfg (PreTrainedConfig): The PreTrainedConfig to read delta_indices from.
-        ds_meta (LeRobotDatasetMetadata): The dataset from which features and fps are used to build
-            delta_timestamps against.
-
-    Returns:
-        dict[str, list] | None: A dictionary of delta_timestamps, e.g.:
-            {
-                "observation.state": [-0.04, -0.02, 0]
-                "observation.action": [-0.02, 0, 0.02]
-            }
-            returns `None` if the resulting dict is empty.
-    """
     delta_timestamps = {}
     for key in ds_meta.features:
         if key == REWARD and cfg.reward_delta_indices is not None:
@@ -88,12 +108,24 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         ds_meta = LeRobotDatasetMetadata(
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
+
+        selected_episodes = cfg.dataset.episodes
+        if selected_episodes is None and cfg.dataset.split:
+            try:
+                selected_episodes = resolve_split_episodes(ds_meta, cfg.dataset.split)
+            except ValueError as exc:
+                logging.warning("Unable to resolve dataset split '%s': %s", cfg.dataset.split, exc)
+                selected_episodes = None
+
+        if selected_episodes is not None:
+            selected_episodes = sorted(set(selected_episodes))
+
         delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
         if not cfg.dataset.streaming:
             dataset = LeRobotDataset(
                 cfg.dataset.repo_id,
                 root=cfg.dataset.root,
-                episodes=cfg.dataset.episodes,
+                episodes=selected_episodes,
                 delta_timestamps=delta_timestamps,
                 image_transforms=image_transforms,
                 revision=cfg.dataset.revision,
@@ -103,7 +135,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             dataset = StreamingLeRobotDataset(
                 cfg.dataset.repo_id,
                 root=cfg.dataset.root,
-                episodes=cfg.dataset.episodes,
+                episodes=selected_episodes,
                 delta_timestamps=delta_timestamps,
                 image_transforms=image_transforms,
                 revision=cfg.dataset.revision,

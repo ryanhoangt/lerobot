@@ -24,7 +24,12 @@ from huggingface_hub.errors import HfHubHTTPError
 
 from lerobot import envs
 from lerobot.configs import parser
-from lerobot.configs.default import DatasetConfig, EvalConfig, WandBConfig
+from lerobot.configs.default import (
+    DatasetConfig,
+    EvalConfig,
+    OfflineEvalDatasetConfig,
+    WandBConfig,
+)
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.optim import OptimizerConfig
 from lerobot.optim.schedulers import LRSchedulerConfig
@@ -36,6 +41,7 @@ TRAIN_CONFIG_NAME = "train_config.json"
 @dataclass
 class TrainPipelineConfig(HubMixin):
     dataset: DatasetConfig
+    val_dataset: OfflineEvalDatasetConfig | None = None
     env: envs.EnvConfig | None = None
     policy: PreTrainedConfig | None = None
     # Set `dir` to where you would like to save all of the run outputs. If you run another training session
@@ -118,6 +124,18 @@ class TrainPipelineConfig(HubMixin):
 
         if isinstance(self.dataset.repo_id, list):
             raise NotImplementedError("LeRobotMultiDataset is not currently implemented.")
+
+        if self.val_dataset is not None:
+            if self.eval_freq <= 0:
+                raise ValueError("Offline validation requires eval_freq > 0")
+            if not self.val_dataset.split and not self.val_dataset.episodes:
+                raise ValueError("val_dataset requires either 'split' or 'episodes'.")
+            if self.val_dataset.episodes is not None and len(self.val_dataset.episodes) == 0:
+                raise ValueError("val_dataset.episodes must contain at least one episode.")
+            if self.val_dataset.batch_size is not None and self.val_dataset.batch_size <= 0:
+                raise ValueError("val_dataset.batch_size must be positive when provided.")
+            if self.val_dataset.max_batches is not None and self.val_dataset.max_batches <= 0:
+                raise ValueError("val_dataset.max_batches must be positive when provided.")
 
         if not self.use_policy_training_preset and (self.optimizer is None or self.scheduler is None):
             raise ValueError("Optimizer and Scheduler must be set when the policy presets are not used.")

@@ -15,7 +15,9 @@
 # limitations under the License.
 import logging
 import time
+from collections.abc import Mapping
 from contextlib import nullcontext
+from dataclasses import replace
 from pprint import pformat
 from typing import Any
 
@@ -26,7 +28,7 @@ from torch.optim import Optimizer
 
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
-from lerobot.datasets.factory import make_dataset
+from lerobot.datasets.factory import make_dataset, resolve_split_episodes
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import cycle
 from lerobot.envs.factory import make_env
@@ -123,6 +125,98 @@ def update_policy(
     return train_metrics, output_dict
 
 
+
+
+def evaluate_on_dataset(
+    policy: PreTrainedPolicy,
+    dataloader: torch.utils.data.DataLoader,
+    preprocessor,
+    accelerator: Accelerator,
+    *,
+    max_batches: int | None = None,
+) -> dict[str, float]:
+    """Run an offline evaluation pass on a dataloader and aggregate metrics."""
+
+    if dataloader is None:
+        return {}
+
+    device = accelerator.device
+    was_training = policy.training
+    policy.eval()
+
+    reduced_metrics: dict[str, torch.Tensor] = {}
+    total_weight = torch.zeros(1, device=device)
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataloader):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+
+            first_value = next(iter(batch.values()))
+            if isinstance(first_value, torch.Tensor):
+                batch_size = int(first_value.shape[0])
+            else:
+                batch_size = len(first_value)
+
+            batch = preprocessor(batch)
+            with accelerator.autocast():
+                outputs = policy(batch)
+
+            metrics_source: Mapping[str, Any]
+            if isinstance(outputs, Mapping):
+                metrics_source = outputs
+            elif (
+                isinstance(outputs, tuple)
+                and len(outputs) == 2
+                and isinstance(outputs[1], Mapping)
+            ):
+                loss_output, metrics_output = outputs
+                metrics_dict = dict(metrics_output)
+                if "loss" not in metrics_dict and isinstance(loss_output, (torch.Tensor, float, int)):
+                    metrics_dict["loss"] = loss_output
+                metrics_source = metrics_dict
+            else:
+                raise ValueError("Policy evaluate_on_dataset expects a mapping or (loss, metrics) tuple.")
+
+            batch_weight = torch.tensor(float(batch_size), device=device)
+            local_metrics: dict[str, torch.Tensor] = {}
+            for name, value in metrics_source.items():
+                if isinstance(value, torch.Tensor):
+                    reduction = value.detach().to(device=device, dtype=torch.float32).mean()
+                elif isinstance(value, (float, int)):
+                    reduction = torch.tensor(float(value), device=device)
+                else:
+                    continue
+
+                local_metrics[name] = reduction * batch_weight
+
+            for name, weighted_value in local_metrics.items():
+                if name not in reduced_metrics:
+                    reduced_metrics[name] = torch.zeros(1, device=device)
+                reduced_metrics[name] += weighted_value
+
+            total_weight += batch_weight
+
+    accelerator.wait_for_everyone()
+    total_weight = accelerator.reduce(total_weight, reduction="sum")
+    for name in list(reduced_metrics):
+        reduced_metrics[name] = accelerator.reduce(reduced_metrics[name], reduction="sum")
+
+    if was_training:
+        policy.train()
+
+    if total_weight.item() <= 0:
+        return {}
+
+    averaged = {}
+    for name, value in reduced_metrics.items():
+        prefixed = name if name.startswith("val/") else f"val/{name}"
+        averaged[prefixed] = (value / total_weight).item()
+
+    return averaged
+
+
+
 @parser.wrap()
 def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     """
@@ -189,6 +283,47 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if not is_main_process:
         dataset = make_dataset(cfg)
 
+    # Prepare optional offline-validation dataset/dataloader.
+    val_dataset = None
+    val_dataloader = None
+    val_max_batches = cfg.val_dataset.max_batches if cfg.val_dataset else None
+
+    if cfg.val_dataset is not None:
+        if cfg.val_dataset.episodes is not None:
+            eval_episodes = list(cfg.val_dataset.episodes)
+        else:
+            eval_episodes = resolve_split_episodes(
+                dataset.meta, cfg.val_dataset.split or "validation"
+            )
+
+        if not eval_episodes:
+            raise ValueError("Validation dataset resolved to no episodes.")
+
+        eval_episodes = sorted(set(eval_episodes))
+
+        val_cfg = replace(cfg, dataset=replace(cfg.dataset))
+        val_cfg.dataset.episodes = eval_episodes
+        val_cfg.dataset.split = None
+
+        if is_main_process:
+            logging.info("Creating validation dataset (%d episodes)", len(eval_episodes))
+            val_dataset = make_dataset(val_cfg)
+        accelerator.wait_for_everyone()
+        if not is_main_process:
+            val_dataset = make_dataset(val_cfg)
+
+        val_batch_size = cfg.val_dataset.batch_size or cfg.batch_size
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset,
+            num_workers=cfg.num_workers,
+            batch_size=val_batch_size,
+            shuffle=False,
+            drop_last=False,
+            pin_memory=device.type == "cuda",
+            prefetch_factor=2 if cfg.num_workers > 0 else None,
+        )
+
+
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     # using the eval.py instead, with gym_dora environment and dora-rs.
@@ -210,6 +345,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     accelerator.wait_for_everyone()
 
     # Create processors - only provide dataset_stats if not resuming from saved processors
+
     processor_kwargs = {}
     postprocessor_kwargs = {}
     if (cfg.policy.pretrained_path and not cfg.resume) or not cfg.policy.pretrained_path:
@@ -299,6 +435,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     )
     dl_iter = cycle(dataloader)
 
+    if val_dataloader is not None:
+        val_dataloader = accelerator.prepare(val_dataloader)
+
+
     policy.train()
 
     train_metrics = {
@@ -355,6 +495,20 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     wandb_log_dict.update(output_dict)
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
+
+        if val_dataloader is not None and is_eval_step:
+            eval_policy_model = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+            val_metrics = evaluate_on_dataset(
+                eval_policy_model,
+                val_dataloader,
+                preprocessor,
+                accelerator,
+                max_batches=val_max_batches,
+            )
+            if accelerator.is_main_process and val_metrics:
+                logging.info("Validation metrics at step %d: %s", step, val_metrics)
+                if wandb_logger:
+                    wandb_logger.log_dict(val_metrics, step, mode="val")
 
         if cfg.save_checkpoint and is_saving_step:
             if is_main_process:
