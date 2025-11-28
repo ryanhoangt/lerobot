@@ -42,6 +42,7 @@ from lerobot.robots import (  # noqa: F401
     koch_follower,
     make_robot_from_config,
     so100_follower,
+    so101_follower,
 )
 from lerobot.teleoperators import (  # noqa: F401
     TeleoperatorConfig,
@@ -49,6 +50,7 @@ from lerobot.teleoperators import (  # noqa: F401
     koch_leader,
     make_teleoperator_from_config,
     so100_leader,
+    so101_leader,
 )
 from lerobot.utils.robot_utils import busy_wait
 
@@ -77,7 +79,16 @@ def find_joint_and_ee_bounds(cfg: FindJointLimitsConfig):
         # Note to be compatible with the rest of the codebase,
         # we are using the new calibration method for so101 and so100
         robot_type = "so_new_calibration"
-    kinematics = RobotKinematics(cfg.robot.urdf_path, cfg.robot.target_frame_name)
+
+    urdf_path = getattr(cfg.robot, "urdf_path", None)
+    if urdf_path is None:
+        raise ValueError(
+            "Robot configuration must provide 'urdf_path'. "
+            "Set it via --robot.urdf_path=... or by editing the robot config."
+        )
+
+    target_frame_name = getattr(cfg.robot, "target_frame_name", None) or "gripper_frame_link"
+    kinematics = RobotKinematics(urdf_path, target_frame_name)
 
     # Initialize min/max values
     observation = robot.get_observation()

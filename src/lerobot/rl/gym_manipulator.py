@@ -56,6 +56,7 @@ from lerobot.robots import (  # noqa: F401
     RobotConfig,
     make_robot_from_config,
     so100_follower,
+    so101_follower,
 )
 from lerobot.robots.robot import Robot
 from lerobot.robots.so100_follower.robot_kinematic_processor import (
@@ -600,6 +601,14 @@ def control_loop(
     dataset = None
     if cfg.mode == "record":
         action_features = teleop_device.action_features
+        if isinstance(action_features, dict) and "dtype" not in action_features:
+            action_keys = list(action_features.keys())
+            action_features = {
+                "dtype": "float32",
+                "shape": (len(action_keys),),
+                "names": {name: idx for idx, name in enumerate(action_keys)} if action_keys else None,
+            }
+
         features = {
             ACTION: action_features,
             REWARD: {"dtype": "float32", "shape": (1,), "names": None},
@@ -641,19 +650,29 @@ def control_loop(
     episode_step = 0
     episode_start_time = time.perf_counter()
 
+    if hasattr(env, "robot") and hasattr(env.robot, "bus"):
+        motor_names = list(env.robot.bus.motors.keys())
+    else:
+        motor_names = []
+
+    if motor_names and hasattr(env, "get_raw_joint_positions"):
+        raw_joint_positions = env.get_raw_joint_positions() or {}
+        current_action_values = [raw_joint_positions.get(f"{name}.pos", 0.0) for name in motor_names]
+        current_action = torch.tensor(current_action_values, dtype=torch.float32)
+    else:
+        action_shape = getattr(getattr(env, "action_space", None), "shape", None)
+        action_dim = action_shape[0] if action_shape else 0
+        current_action = torch.zeros(action_dim, dtype=torch.float32)
+        if use_gripper and action_dim > 0:
+            current_action[-1] = 1.0
+
     while episode_idx < cfg.dataset.num_episodes_to_record:
         step_start_time = time.perf_counter()
 
-        # Create a neutral action (no movement)
-        neutral_action = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
-        if use_gripper:
-            neutral_action = torch.cat([neutral_action, torch.tensor([1.0])])  # Gripper stay
-
-        # Use the new step function
         transition = step_env_and_process_transition(
             env=env,
             transition=transition,
-            action=neutral_action,
+            action=current_action,
             env_processor=env_processor,
             action_processor=action_processor,
         )
@@ -683,6 +702,18 @@ def control_loop(
             if dataset is not None:
                 frame["task"] = cfg.dataset.task
                 dataset.add_frame(frame)
+
+        processed_action = transition.get(TransitionKey.ACTION)
+        if processed_action is not None:
+            if isinstance(processed_action, torch.Tensor):
+                updated_action = processed_action.detach().clone()
+                if updated_action.dim() > 1:
+                    updated_action = updated_action.squeeze(0)
+                current_action = updated_action.cpu()
+            elif isinstance(processed_action, np.ndarray):
+                current_action = torch.from_numpy(processed_action).to(torch.float32)
+            elif isinstance(processed_action, (list, tuple)):
+                current_action = torch.tensor(processed_action, dtype=torch.float32)
 
         episode_step += 1
 

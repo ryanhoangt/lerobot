@@ -21,6 +21,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import datasets
+from datasets.utils.logging import disable_progress_bar, enable_progress_bar
 import numpy as np
 import packaging.version
 import pandas as pd
@@ -1136,6 +1137,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         tasks = episode_buffer.pop("task")
         episode_tasks = list(set(tasks))
         episode_index = episode_buffer["episode_index"]
+        logging.info("Episode %s: saving %d frames", episode_index, episode_length)
+
 
         episode_buffer["index"] = np.arange(self.meta.total_frames, self.meta.total_frames + episode_length)
         episode_buffer["episode_index"] = np.full((episode_length,), episode_index)
@@ -1167,6 +1170,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         # `meta.save_episode` need to be executed after encoding the videos
         self.meta.save_episode(episode_index, episode_length, episode_tasks, ep_stats, ep_metadata)
+        logging.info("Episode %s: dataset metadata updated", episode_index)
 
         if has_video_keys and use_batched_encoding:
             # Check if we should trigger batch encoding
@@ -1180,6 +1184,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if not episode_data:
             # Reset episode buffer and clean up temporary images (if not already deleted during video encoding)
             self.clear_episode_buffer(delete_images=len(self.meta.image_keys) > 0)
+
+        logging.info("Episode %s: save complete", episode_index)
 
     def _batch_save_episode_video(self, start_episode: int, end_episode: int | None = None) -> None:
         """
@@ -1249,8 +1255,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
         """
         # Convert buffer into HF Dataset
         ep_dict = {key: episode_buffer[key] for key in self.hf_features}
-        ep_dataset = datasets.Dataset.from_dict(ep_dict, features=self.hf_features, split="train")
-        ep_dataset = embed_images(ep_dataset)
+        disable_progress_bar()
+        try:
+            ep_dataset = datasets.Dataset.from_dict(ep_dict, features=self.hf_features, split="train")
+            ep_dataset = embed_images(ep_dataset)
+        finally:
+            enable_progress_bar()
         ep_num_frames = len(ep_dataset)
 
         if self.latest_episode is None:
@@ -1333,6 +1343,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         ep_path = self._encode_temporary_episode_video(video_key, episode_index)
         ep_size_in_mb = get_file_size_in_mb(ep_path)
         ep_duration_in_s = get_video_duration_in_s(ep_path)
+        target_path = None
+
 
         if (
             episode_index == 0
@@ -1355,6 +1367,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             )
             new_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(ep_path), str(new_path))
+            target_path = new_path
         else:
             # Retrieve information from the latest updated video file using latest_episode
             latest_ep = self.meta.latest_episode
@@ -1375,6 +1388,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 )
                 new_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(ep_path), str(new_path))
+                target_path = new_path
                 latest_duration_in_s = 0.0
             else:
                 # Update latest video file
@@ -1382,8 +1396,23 @@ class LeRobotDataset(torch.utils.data.Dataset):
                     [latest_path, ep_path],
                     latest_path,
                 )
+                target_path = latest_path
 
         # Remove temporary directory
+        if target_path is not None:
+            try:
+                rel_path = target_path.relative_to(self.root)
+            except ValueError:
+                rel_path = target_path
+            logging.info(
+                "Episode %s: video '%s' stored at %s (%.2fs)",
+                episode_index,
+                video_key,
+                rel_path,
+                ep_duration_in_s,
+            )
+
+
         shutil.rmtree(str(ep_path.parent))
 
         # Update video info (only needed when first episode is encoded since it reads from episode 0)
@@ -1450,7 +1479,23 @@ class LeRobotDataset(torch.utils.data.Dataset):
         """
         temp_path = Path(tempfile.mkdtemp(dir=self.root)) / f"{video_key}_{episode_index:03d}.mp4"
         img_dir = self._get_image_file_dir(episode_index, video_key)
-        encode_video_frames(img_dir, temp_path, self.fps, overwrite=True)
+
+        logging.info(
+            "Episode %s: encoding raw frames for '%s'", episode_index, video_key
+        )
+        encode_video_frames(
+            img_dir,
+            temp_path,
+            self.fps,
+            overwrite=True,
+        )
+        logging.info(
+            "Episode %s: encoded temp video '%s' (%s)",
+            episode_index,
+            video_key,
+            temp_path.name,
+        )
+
         shutil.rmtree(img_dir)
         return temp_path
 
