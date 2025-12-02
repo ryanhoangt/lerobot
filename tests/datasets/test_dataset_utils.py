@@ -19,6 +19,7 @@ import torch
 from datasets import Dataset
 from huggingface_hub import DatasetCard
 
+from lerobot.datasets.factory import resolve_split_episodes
 from lerobot.datasets.push_dataset_to_hub.utils import calculate_episode_data_index
 from lerobot.datasets.utils import combine_feature_dicts, create_lerobot_dataset_card, hf_transform_to_torch
 from lerobot.utils.constants import ACTION, OBS_IMAGES
@@ -131,3 +132,26 @@ def test_non_dict_passthrough_last_wins():
     out = combine_feature_dicts(g1, g2)
     # For non-dict entries the last one wins
     assert out["misc"] == 456
+
+
+def test_resolve_split_range(tmp_path, info_factory, lerobot_dataset_metadata_factory):
+    info = info_factory(total_episodes=6, total_frames=60, total_tasks=1)
+    info["splits"] = {"train": "0:4", "validation": "4:6"}
+    meta = lerobot_dataset_metadata_factory(root=tmp_path, info=info)
+    assert resolve_split_episodes(meta, "validation") == [4, 5]
+
+
+def test_resolve_split_list(tmp_path, info_factory, lerobot_dataset_metadata_factory):
+    info = info_factory(total_episodes=6, total_frames=60, total_tasks=1)
+    info["splits"] = {"validation": [0, 2, 4]}
+    meta = lerobot_dataset_metadata_factory(root=tmp_path, info=info)
+    assert resolve_split_episodes(meta, "validation") == [0, 2, 4]
+
+
+def test_resolve_split_missing(tmp_path, info_factory, lerobot_dataset_metadata_factory):
+    info = info_factory(total_episodes=4, total_frames=40, total_tasks=1)
+    info["splits"] = {"train": "0:3"}
+    meta = lerobot_dataset_metadata_factory(root=tmp_path, info=info)
+    with pytest.raises(ValueError, match="not found"):
+        resolve_split_episodes(meta, "validation")
+
