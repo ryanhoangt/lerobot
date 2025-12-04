@@ -1,0 +1,31 @@
+{
+    "env": {
+        "type": "gym_manipulator",
+        "name": "real_robot",
+        "fps": 10,
+        "processor": {
+            "reset": {
+                "reset_time_s": 5.0,
+                "control_time_s": 20.0,
+                "terminate_on_success": false
+            },
+            "gripper": {
+                "use_gripper": true
+            }
+        },
+        "robot": {
+        },
+        "teleop": {
+        }
+    },
+    "dataset": {
+        "repo_id": "hf_username/dataset_name",
+        "dataset_root": "data/your_dataset",
+        "task": "reward_classifier_task",
+        "num_episodes_to_record": 20,
+        "replay_episode": null,
+        "push_to_hub": true
+    },
+    "mode": "record",
+    "device": "cpu"
+}

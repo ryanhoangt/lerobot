@@ -1,0 +1,75 @@
+{
+    "env": {
+        "name": "real_robot",
+        "fps": 10,
+        "processor": {
+            "control_mode": "keyboard_ee",
+            "observation": {
+                "display_cameras": true
+            },
+            "image_preprocessing": {
+                "crop_params_dict": {},
+                "resize_size": [
+                    128,
+                    128
+                ]
+            },
+            "gripper": {
+                "use_gripper": true,
+                "gripper_penalty": 0.0
+            },
+            "reset": {
+                "reset_time_s": 10.0,
+                "control_time_s": 40.0
+            },
+            "inverse_kinematics": {
+                "urdf_path": "playground/SO-ARM100/Simulation/SO101/so101_new_calib.urdf",
+                "end_effector_bounds": {
+                    "min": [
+                        0.1321,
+                        -0.0941,
+                        -0.0199
+                    ],
+                    "max": [
+                        0.3345,
+                        0.0823,
+                        0.0298
+                    ]
+                },
+                "end_effector_step_sizes": {
+                    "x": 0.02,
+                    "y": 0.02,
+                    "z": 0.02
+                },
+                "target_frame_name": "gripper_frame_link"
+            }
+        },
+        "robot": {
+            "type": "so101_follower",
+            "port": "/dev/tty.wchusbserial5AB90657451",
+            "id": "hoang_follower_arm",
+            "cameras": {
+                "front": {
+                    "type": "opencv",
+                    "index_or_path": 2,
+                    "height": 1080,
+                    "width": 1920,
+                    "fps": 30
+                }
+            }
+        },
+        "teleop": {
+            "type": "keyboard_ee"
+        }
+    },
+    "dataset": {
+        "repo_id": "ryanhoangt/pick_and_lift_round_box_hil",
+        "root": null,
+        "task": "pick_and_lift",
+        "num_episodes_to_record": 15,
+        "replay_episode": 0,
+        "push_to_hub": true
+    },
+    "mode": "record",
+    "device": "cpu"
+}

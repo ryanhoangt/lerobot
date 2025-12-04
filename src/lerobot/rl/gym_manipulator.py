@@ -56,6 +56,7 @@ from lerobot.robots import (  # noqa: F401
     RobotConfig,
     make_robot_from_config,
     so100_follower,
+    so101_follower,
 )
 from lerobot.robots.robot import Robot
 from lerobot.robots.so100_follower.robot_kinematic_processor import (
@@ -77,7 +78,7 @@ from lerobot.utils.constants import ACTION, DONE, OBS_IMAGES, OBS_STATE, REWARD
 from lerobot.utils.robot_utils import busy_wait
 from lerobot.utils.utils import log_say
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 
 
 @dataclass
@@ -126,7 +127,7 @@ class RobotEnv(gym.Env):
         use_gripper: bool = False,
         display_cameras: bool = False,
         reset_pose: list[float] | None = None,
-        reset_time_s: float = 5.0,
+        reset_time_s: float = 10.0,
     ) -> None:
         """Initialize robot environment with configuration options.
 
@@ -238,7 +239,9 @@ class RobotEnv(gym.Env):
             reset_follower_position(self.robot, np.array(self.reset_pose))
             log_say("Reset the environment done.", play_sounds=True)
 
+        print("Waiting for reset to complete...")
         busy_wait(self.reset_time_s - (time.perf_counter() - start_time))
+        print("Reset complete.")
 
         super().reset(seed=seed, options=options)
 
@@ -594,6 +597,17 @@ def control_loop(
     transition = create_transition(observation=obs, info=info, complementary_data=complementary_data)
     transition = env_processor(data=transition)
 
+    initial_joint_positions = transition[TransitionKey.OBSERVATION].get(OBS_STATE)
+    if initial_joint_positions is not None:
+        if isinstance(initial_joint_positions, torch.Tensor):
+            initial_joint_positions = initial_joint_positions.squeeze(0).detach().cpu().numpy()
+        print("[Recorder] Initial joint positions:", initial_joint_positions)
+    else:
+        print(
+            "[Recorder] Initial joint positions unavailable. Observation keys:",
+            list(transition[TransitionKey.OBSERVATION].keys()),
+        )
+
     # Determine if gripper is used
     use_gripper = cfg.env.processor.gripper.use_gripper if cfg.env.processor.gripper is not None else True
 
@@ -641,82 +655,94 @@ def control_loop(
     episode_step = 0
     episode_start_time = time.perf_counter()
 
-    while episode_idx < cfg.dataset.num_episodes_to_record:
-        step_start_time = time.perf_counter()
+    try:
+        while episode_idx < cfg.dataset.num_episodes_to_record:
+            step_start_time = time.perf_counter()
 
-        # Create a neutral action (no movement)
-        neutral_action = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
-        if use_gripper:
-            neutral_action = torch.cat([neutral_action, torch.tensor([1.0])])  # Gripper stay
-
-        # Use the new step function
-        transition = step_env_and_process_transition(
-            env=env,
-            transition=transition,
-            action=neutral_action,
-            env_processor=env_processor,
-            action_processor=action_processor,
-        )
-        terminated = transition.get(TransitionKey.DONE, False)
-        truncated = transition.get(TransitionKey.TRUNCATED, False)
-
-        if cfg.mode == "record":
-            observations = {
-                k: v.squeeze(0).cpu()
-                for k, v in transition[TransitionKey.OBSERVATION].items()
-                if isinstance(v, torch.Tensor)
-            }
-            # Use teleop_action if available, otherwise use the action from the transition
-            action_to_record = transition[TransitionKey.COMPLEMENTARY_DATA].get(
-                "teleop_action", transition[TransitionKey.ACTION]
-            )
-            frame = {
-                **observations,
-                ACTION: action_to_record.cpu(),
-                REWARD: np.array([transition[TransitionKey.REWARD]], dtype=np.float32),
-                DONE: np.array([terminated or truncated], dtype=bool),
-            }
+            # Create a neutral action (no movement)
+            neutral_action = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
             if use_gripper:
-                discrete_penalty = transition[TransitionKey.COMPLEMENTARY_DATA].get("discrete_penalty", 0.0)
-                frame["complementary_info.discrete_penalty"] = np.array([discrete_penalty], dtype=np.float32)
+                neutral_action = torch.cat([neutral_action, torch.tensor([1.0])])  # Gripper stay
 
-            if dataset is not None:
-                frame["task"] = cfg.dataset.task
-                dataset.add_frame(frame)
-
-        episode_step += 1
-
-        # Handle episode termination
-        if terminated or truncated:
-            episode_time = time.perf_counter() - episode_start_time
-            logging.info(
-                f"Episode ended after {episode_step} steps in {episode_time:.1f}s with reward {transition[TransitionKey.REWARD]}"
+            # Use the new step function
+            transition = step_env_and_process_transition(
+                env=env,
+                transition=transition,
+                action=neutral_action,
+                env_processor=env_processor,
+                action_processor=action_processor,
             )
-            episode_step = 0
-            episode_idx += 1
+            terminated = transition.get(TransitionKey.DONE, False)
+            truncated = transition.get(TransitionKey.TRUNCATED, False)
 
-            if dataset is not None:
-                if transition[TransitionKey.INFO].get(TeleopEvents.RERECORD_EPISODE, False):
-                    logging.info(f"Re-recording episode {episode_idx}")
-                    dataset.clear_episode_buffer()
-                    episode_idx -= 1
-                else:
-                    logging.info(f"Saving episode {episode_idx}")
-                    dataset.save_episode()
+            if cfg.mode == "record":
+                observations = {
+                    k: v.squeeze(0).cpu()
+                    for k, v in transition[TransitionKey.OBSERVATION].items()
+                    if isinstance(v, torch.Tensor)
+                }
+                # Use teleop_action if available, otherwise use the action from the transition
+                action_to_record = transition[TransitionKey.COMPLEMENTARY_DATA].get(
+                    "teleop_action", transition[TransitionKey.ACTION]
+                )
+                frame = {
+                    **observations,
+                    ACTION: action_to_record.cpu(),
+                    REWARD: np.array([transition[TransitionKey.REWARD]], dtype=np.float32),
+                    DONE: np.array([terminated or truncated], dtype=bool),
+                }
+                if use_gripper:
+                    discrete_penalty = transition[TransitionKey.COMPLEMENTARY_DATA].get("discrete_penalty", 0.0)
+                    frame["complementary_info.discrete_penalty"] = np.array([discrete_penalty], dtype=np.float32)
 
-            # Reset for new episode
-            obs, info = env.reset()
-            env_processor.reset()
-            action_processor.reset()
+                if dataset is not None:
+                    frame["task"] = cfg.dataset.task
+                    dataset.add_frame(frame)
 
-            transition = create_transition(observation=obs, info=info)
-            transition = env_processor(transition)
+            episode_step += 1
 
-        # Maintain fps timing
-        busy_wait(dt - (time.perf_counter() - step_start_time))
+            # Handle episode termination
+            if terminated or truncated:
+                episode_time = time.perf_counter() - episode_start_time
+                print(
+                    f"Episode ended after {episode_step} steps in {episode_time:.1f}s with reward {transition[TransitionKey.REWARD]}"
+                )
+                episode_step = 0
+                episode_idx += 1
+
+                if dataset is not None:
+                    if transition[TransitionKey.INFO].get(TeleopEvents.RERECORD_EPISODE, False):
+                        print(f"Re-recording episode {episode_idx}")
+                        dataset.clear_episode_buffer()
+                        episode_idx -= 1
+                    else:
+                        print(f"Saving episode {episode_idx}")
+                        dataset.save_episode()
+                        print(f"[Recorder] Episode {episode_idx} saved.")
+
+                if episode_idx >= cfg.dataset.num_episodes_to_record:
+                    print("[Recorder] All requested episodes captured. You can press Ctrl+C to exit.")
+                    break
+
+                # Reset for new episode
+                obs, info = env.reset()
+                env_processor.reset()
+                action_processor.reset()
+
+                transition = create_transition(observation=obs, info=info)
+                transition = env_processor(transition)
+                print(
+                    f"[Recorder] Episode {episode_idx + 1}/{cfg.dataset.num_episodes_to_record} ready for recording."
+                )
+
+            # Maintain fps timing
+            busy_wait(dt - (time.perf_counter() - step_start_time))
+    finally:
+        if dataset is not None:
+            dataset.finalize()
 
     if dataset is not None and cfg.dataset.push_to_hub:
-        logging.info("Pushing dataset to hub")
+        print("Pushing dataset to hub")
         dataset.push_to_hub()
 
 

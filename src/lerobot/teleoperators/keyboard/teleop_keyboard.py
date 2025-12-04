@@ -60,6 +60,8 @@ class KeyboardTeleop(Teleoperator):
         self.current_pressed = {}
         self.listener = None
         self.logs = {}
+        self.intervention_enabled = False
+        self._toggle_keys_active: set[Any] = set()
 
     @property
     def action_features(self) -> dict:
@@ -102,20 +104,33 @@ class KeyboardTeleop(Teleoperator):
         pass
 
     def _on_press(self, key):
-        if hasattr(key, "char"):
-            self.event_queue.put((key.char, True))
+        self.event_queue.put((key, True))
+        if key == keyboard.Key.space:
+            if key not in self._toggle_keys_active:
+                self.intervention_enabled = not self.intervention_enabled
+                self._toggle_keys_active.add(key)
+                logging.info(
+                    "Keyboard intervention %s",
+                    "enabled" if self.intervention_enabled else "disabled",
+                )
+        elif hasattr(key, "char") and key.char in {"s", "r", "q"}:
+            self.misc_keys_queue.put(key.char)
 
     def _on_release(self, key):
-        if hasattr(key, "char"):
-            self.event_queue.put((key.char, False))
+        self.event_queue.put((key, False))
+        if key == keyboard.Key.space:
+            self._toggle_keys_active.discard(key)
         if key == keyboard.Key.esc:
             logging.info("ESC pressed, disconnecting.")
             self.disconnect()
 
     def _drain_pressed_keys(self):
         while not self.event_queue.empty():
-            key_char, is_pressed = self.event_queue.get_nowait()
-            self.current_pressed[key_char] = is_pressed
+            key, is_pressed = self.event_queue.get_nowait()
+            if is_pressed:
+                self.current_pressed[key] = True
+            else:
+                self.current_pressed.pop(key, None)
 
     def configure(self):
         pass
@@ -146,6 +161,11 @@ class KeyboardTeleop(Teleoperator):
             )
         if self.listener is not None:
             self.listener.stop()
+        self.current_pressed.clear()
+        if hasattr(self, "_toggle_keys_active"):
+            self._toggle_keys_active.clear()
+        if hasattr(self, "intervention_enabled"):
+            self.intervention_enabled = False
 
 
 class KeyboardEndEffectorTeleop(KeyboardTeleop):
@@ -192,29 +212,22 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
         # Generate action based on current key states
         for key, val in self.current_pressed.items():
             if key == keyboard.Key.up:
-                delta_y = -int(val)
-            elif key == keyboard.Key.down:
-                delta_y = int(val)
-            elif key == keyboard.Key.left:
                 delta_x = int(val)
-            elif key == keyboard.Key.right:
+            elif key == keyboard.Key.down:
                 delta_x = -int(val)
+            elif key == keyboard.Key.left:
+                delta_y = -int(val)
+            elif key == keyboard.Key.right:
+                delta_y = int(val)
             elif key == keyboard.Key.shift:
                 delta_z = -int(val)
             elif key == keyboard.Key.shift_r:
                 delta_z = int(val)
-            elif key == keyboard.Key.ctrl_r:
+            elif key == keyboard.Key.alt_r:
                 # Gripper actions are expected to be between 0 (close), 1 (stay), 2 (open)
                 gripper_action = int(val) + 1
-            elif key == keyboard.Key.ctrl_l:
+            elif key == keyboard.Key.alt_l:
                 gripper_action = int(val) - 1
-            elif val:
-                # If the key is pressed, add it to the misc_keys_queue
-                # this will record key presses that are not part of the delta_x, delta_y, delta_z
-                # this is useful for retrieving other events like interventions for RL, episode success, etc.
-                self.misc_keys_queue.put(key)
-
-        self.current_pressed.clear()
 
         action_dict = {
             "delta_x": delta_x,
@@ -261,10 +274,10 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
             keyboard.Key.right,
             keyboard.Key.shift,
             keyboard.Key.shift_r,
-            keyboard.Key.ctrl_r,
-            keyboard.Key.ctrl_l,
+            keyboard.Key.alt_r,
+            keyboard.Key.alt_l,
         ]
-        is_intervention = any(self.current_pressed.get(key, False) for key in movement_keys)
+        is_intervention = self.intervention_enabled
 
         # Check for episode control commands from misc_keys_queue
         terminate_episode = False
