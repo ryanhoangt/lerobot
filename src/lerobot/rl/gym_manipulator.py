@@ -543,8 +543,12 @@ def step_env_and_process_transition(
     terminated = terminated or processed_action_transition[TransitionKey.DONE]
     truncated = truncated or processed_action_transition[TransitionKey.TRUNCATED]
     complementary_data = processed_action_transition[TransitionKey.COMPLEMENTARY_DATA].copy()
-    new_info = processed_action_transition[TransitionKey.INFO].copy()
-    new_info.update(info)
+
+    env_info = info if isinstance(info, dict) else {}
+    teleop_info = processed_action_transition.get(TransitionKey.INFO, {})
+    new_info = env_info.copy()
+    if isinstance(teleop_info, dict):
+        new_info.update(teleop_info)
 
     new_transition = create_transition(
         observation=obs,

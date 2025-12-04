@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import functools
+import logging
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from typing import TypedDict
@@ -126,7 +127,22 @@ class ReplayBuffer:
 
         if image_augmentation_function is None:
             base_function = functools.partial(random_shift, pad=4)
-            self.image_augmentation_function = torch.compile(base_function)
+            self.image_augmentation_function = base_function
+
+            device_str = (
+                self.device.type if isinstance(self.device, torch.device) else str(self.device)
+            ).lower()
+            should_compile = not device_str.startswith("mps")
+
+            if should_compile:
+                try:
+                    self.image_augmentation_function = torch.compile(base_function)
+                except (RuntimeError, NotImplementedError, SyntaxError) as exc:
+                    logging.warning(
+                        "Falling back to eager random_shift augmentation because torch.compile failed: %s",
+                        exc,
+                    )
+                    self.image_augmentation_function = base_function
         self.use_drq = use_drq
 
     def _initialize_storage(
